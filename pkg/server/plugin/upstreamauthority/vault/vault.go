@@ -11,7 +11,7 @@ import (
 	"github.com/hashicorp/hcl"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-
+	"github.com/spiffe/spire-plugin-sdk/proto/spire/plugin/types"
 	upstreamauthorityv1 "github.com/spiffe/spire-plugin-sdk/proto/spire/plugin/server/upstreamauthority/v1"
 	configv1 "github.com/spiffe/spire-plugin-sdk/proto/spire/service/common/config/v1"
 	"github.com/spiffe/spire/pkg/common/catalog"
@@ -162,26 +162,9 @@ func (p *Plugin) Configure(_ context.Context, req *configv1.ConfigureRequest) (*
 	return &configv1.ConfigureResponse{}, nil
 }
 
-func (p *Plugin) MintX509CAAndSubscribe(req *upstreamauthorityv1.MintX509CARequest, stream upstreamauthorityv1.UpstreamAuthority_MintX509CAAndSubscribeServer) error {
-	if p.cc == nil {
-		return status.Error(codes.FailedPrecondition, "plugin not configured")
-	}
-
-	var ttl string
-	if req.PreferredTtl == 0 {
-		ttl = ""
-	} else {
-		ttl = strconv.Itoa(int(req.PreferredTtl))
-	}
-
-	csr, err := x509.ParseCertificateRequest(req.Csr)
-	if err != nil {
-		return status.Errorf(codes.InvalidArgument, "failed to parse CSR data: %v", err)
-	}
-
+func (p *Plugin) renewVaultClientAuthIfRequired() (err error) {
 	p.mtx.Lock()
 	defer p.mtx.Unlock()
-
 	renewCh := make(chan struct{})
 	if p.vc == nil {
 		vc, err := p.cc.NewAuthenticatedClient(p.authMethod, renewCh)
@@ -200,13 +183,17 @@ func (p *Plugin) MintX509CAAndSubscribe(req *upstreamauthorityv1.MintX509CAReque
 			p.logger.Debug("Going to re-authenticate to the Vault at the next signing request time")
 		}()
 	}
+	return
+}
 
+func (p *Plugin) fetchSignedCAChainWithRoots(ttl string, csr *x509.CertificateRequest) (caChain []*types.X509Certificate, upstreamRoots []*types.X509Certificate, err error) {
 	signResp, err := p.vc.SignIntermediate(ttl, csr)
 	if err != nil {
-		return err
+		return
 	}
 	if signResp == nil {
-		return status.Error(codes.Internal, "unexpected empty response from UpstreamAuthority")
+		err = status.Error(codes.Internal, "unexpected empty response from UpstreamAuthority") 
+		return 
 	}
 
 	// Parse CACert in PEM format
@@ -218,18 +205,21 @@ func (p *Plugin) MintX509CAAndSubscribe(req *upstreamauthorityv1.MintX509CAReque
 	}
 	upstreamRoot, err := pemutil.ParseCertificate([]byte(upstreamRootPEM))
 	if err != nil {
-		return status.Errorf(codes.Internal, "failed to parse Root CA certificate: %v", err)
+		err = status.Errorf(codes.Internal, "failed to parse Root CA certificate: %v", err)
+		return 
 	}
 
-	upstreamX509Roots, err := x509certificate.ToPluginProtos([]*x509.Certificate{upstreamRoot})
+	upstreamRoots, err = x509certificate.ToPluginProtos([]*x509.Certificate{upstreamRoot})
 	if err != nil {
-		return status.Errorf(codes.Internal, "unable to form response upstream X.509 roots: %v", err)
+		err = status.Errorf(codes.Internal, "unable to form response upstream X.509 roots: %v", err)
+		return 
 	}
 
 	// Parse PEM format data to get DER format data
 	certificate, err := pemutil.ParseCertificate([]byte(signResp.CACertPEM))
 	if err != nil {
-		return status.Errorf(codes.Internal, "failed to parse certificate: %v", err)
+		err = status.Errorf(codes.Internal, "failed to parse certificate: %v", err)
+		return 
 	}
 	certChain := []*x509.Certificate{certificate}
 	for _, c := range signResp.UpstreamCACertChainPEM {
@@ -241,17 +231,53 @@ func (p *Plugin) MintX509CAAndSubscribe(req *upstreamauthorityv1.MintX509CAReque
 		if c == signResp.CACertPEM {
 			continue
 		}
-
-		b, err := pemutil.ParseCertificate([]byte(c))
+		var b *x509.Certificate
+		b, err = pemutil.ParseCertificate([]byte(c))
 		if err != nil {
-			return status.Errorf(codes.Internal, "failed to parse upstream bundle certificates: %v", err)
+			err = status.Errorf(codes.Internal, "failed to parse upstream bundle certificates: %v", err)
+			return 
 		}
 		certChain = append(certChain, b)
 	}
 
-	x509CAChain, err := x509certificate.ToPluginProtos(certChain)
+	caChain, err = x509certificate.ToPluginProtos(certChain)
 	if err != nil {
-		return status.Errorf(codes.Internal, "unable to form response X.509 CA chain: %v", err)
+		err = status.Errorf(codes.Internal, "unable to form response X.509 CA chain: %v", err)
+		return 
+	}
+
+	return
+}
+
+
+func (p *Plugin) MintX509CAAndSubscribe(req *upstreamauthorityv1.MintX509CARequest, stream upstreamauthorityv1.UpstreamAuthority_MintX509CAAndSubscribeServer) error {
+	if p.cc == nil {
+		return status.Error(codes.FailedPrecondition, "plugin not configured")
+	}
+
+	var ttl string
+	if req.PreferredTtl == 0 {
+		ttl = ""
+	} else {
+		ttl = strconv.Itoa(int(req.PreferredTtl))
+	}
+
+	csr, err := x509.ParseCertificateRequest(req.Csr)
+	if err != nil {
+		return status.Errorf(codes.InvalidArgument, "failed to parse CSR data: %v", err)
+	}
+
+	// Lock is not required since the client is not getting initialized here, moved lock to renew method.
+	// p.mtx.Lock()
+	// defer p.mtx.Unlock()
+
+	// ensure vault client is authenticated and exists
+	err = p.renewVaultClientAuthIfRequired()
+	if err != nil { return err }
+
+	x509CAChain, upstreamX509Roots, err := p.fetchSignedCAChainWithRoots(ttl, csr)
+	if err != nil {
+		return err
 	}
 
 	return stream.Send(&upstreamauthorityv1.MintX509CAResponse{
