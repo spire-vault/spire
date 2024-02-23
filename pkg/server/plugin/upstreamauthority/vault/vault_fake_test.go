@@ -14,6 +14,7 @@ const (
 	defaultSignIntermediateEndpoint = "/v1/pki/root/sign-intermediate"
 	defaultRenewEndpoint            = "/v1/auth/token/renew-self"
 	defaultLookupSelfEndpoint       = "/v1/auth/token/lookup-self"
+	defaultCAFetchEndpoint          = "/v1/pki/cert/ca"
 
 	listenAddr = "127.0.0.1:0"
 )
@@ -243,6 +244,13 @@ token_auth {
     "entity_id": "c69a6e0e-3f2c-98a0-39f9-e4d3d7cc294f",
     "token_type": "batch",
     "orphan": true
+  }
+}`
+
+	testCAFetchResponse = `{
+  
+  "data": {
+    "certificate": "-----BEGIN CERTIFICATE-----\nMIIDXjCCAkagAwIBAgIUJgYcK5K+iekHbdcC/uM0KMTUOV0wDQYJKoZIhvcNAQEL\nBQAwIzEhMB8GA1UEAxMYdXBzdGVyZWFtLWNhLmV4YW1wbGUub3JnMB4XDTIzMDMx\nMzA4MzQwOFoXDTI0MDMxMjA4MzQzOFowIzEhMB8GA1UEAxMYdXBzdGVyZWFtLWNh\nLmV4YW1wbGUub3JnMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA6K2a\nsB4XhQ4Hdvn8OoIh35GdWut2tAVAB9l384RNhkuNbIzwSxHYeSFobFO5S37PLehE\nS0NaIsJL/KXHRpoRo9fHME2FYnNfWH5OmbF4cHUqNsVe/q5If3gNoqcsfF24k58t\nbfrZhi6tZkSyvo7uGnQjvX6yHJaCgTHaAOxPshnflQHF1eK13EtQdW82md4m4IS1\ndyQADwVWeRihd/7CCvWyTdxMb84gS81fyWtKt7e4kHxWL3nO9acVs/W1YXk06BqS\ni/8WjXW31Bp9Th0rYBRvms9RlF5KZ+aJAwuhsZPsQVLGxeCG7vngwtw2/tHOTCaV\ncmQ8yVf9v8mNF/wASQIDAQABo4GJMIGGMA4GA1UdDwEB/wQEAwIBBjAPBgNVHRMB\nAf8EBTADAQH/MB0GA1UdDgQWBBSS42phwAI2yrON9BINagtzS1wwDTAfBgNVHSME\nGDAWgBSS42phwAI2yrON9BINagtzS1wwDTAjBgNVHREEHDAaghh1cHN0ZXJlYW0t\nY2EuZXhhbXBsZS5vcmcwDQYJKoZIhvcNAQELBQADggEBAJOCCLwqSo8zAt20m3zA\nWpaAaXdhj4NnI5Eq6R58M7nND4wnf3Mx2HgXrWhOr9FY1bxx5w2HBqfDWS/rDzpV\nH+JCq9eyBJtyCs2H96T50Hk1LJ5emyJ+RbhjyuqYIR8yAMji+dR/MO644NcnmWIC\neKJQvOafgutVmiaSTQCE04A3PtZXyFQU03XRu2sVbA/2ss+o0zXpqC39pPosCzmZ\nO01/XwlYFpqqD1mxlrwnO9QPSeIML0Yv3XEitr/1Ip0lgV20HvSewF3BMz6Jn/Ba\nE8totCyx5snSpKnzDSiooICeXgxVwvDboBtbzxAQ032Ix7qja0r5t9B8sMtnmJ1g\nyjc=\n-----END CERTIFICATE-----"
   }
 }`
 
@@ -486,6 +494,11 @@ type FakeVaultServerConfig struct {
 	LookupSelfReqHandler         func(code int, resp []byte) func(w http.ResponseWriter, r *http.Request)
 	LookupSelfResponseCode       int
 	LookupSelfResponse           []byte
+
+	CAFetchReqEndpoint  string
+	CAFetchReqHandler   func(code int, resp []byte) func(w http.ResponseWriter, r *http.Request)
+	CAFetchResponseCode int
+	CAFetchResponse     []byte
 }
 
 // NewFakeVaultServerConfig returns VaultServerConfig with default values
@@ -504,6 +517,9 @@ func NewFakeVaultServerConfig() *FakeVaultServerConfig {
 		RenewReqHandler:             defaultReqHandler,
 		LookupSelfReqEndpoint:       defaultLookupSelfEndpoint,
 		LookupSelfReqHandler:        defaultReqHandler,
+
+		CAFetchReqEndpoint: defaultCAFetchEndpoint,
+		CAFetchReqHandler:  defaultReqHandler,
 	}
 }
 
@@ -536,6 +552,7 @@ func (v *FakeVaultServerConfig) NewTLSServer() (srv *httptest.Server, addr strin
 	mux.HandleFunc(v.SignIntermediateReqEndpoint, v.SignIntermediateReqHandler(v.SignIntermediateResponseCode, v.SignIntermediateResponse))
 	mux.HandleFunc(v.RenewReqEndpoint, v.RenewReqHandler(v.RenewResponseCode, v.RenewResponse))
 	mux.HandleFunc(v.LookupSelfReqEndpoint, v.LookupSelfReqHandler(v.LookupSelfResponseCode, v.LookupSelfResponse))
+	mux.HandleFunc(v.CAFetchReqEndpoint, v.CAFetchReqHandler(v.CAFetchResponseCode, v.CAFetchResponse))
 
 	srv = httptest.NewUnstartedServer(mux)
 	srv.Listener = l

@@ -3,24 +3,28 @@ package vault
 import (
 	"context"
 	"crypto/x509"
+	"fmt"
 	"os"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/hcl"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
-	"github.com/spiffe/spire-plugin-sdk/proto/spire/plugin/types"
 	upstreamauthorityv1 "github.com/spiffe/spire-plugin-sdk/proto/spire/plugin/server/upstreamauthority/v1"
+	"github.com/spiffe/spire-plugin-sdk/proto/spire/plugin/types"
 	configv1 "github.com/spiffe/spire-plugin-sdk/proto/spire/service/common/config/v1"
 	"github.com/spiffe/spire/pkg/common/catalog"
 	"github.com/spiffe/spire/pkg/common/coretypes/x509certificate"
 	"github.com/spiffe/spire/pkg/common/pemutil"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 const (
 	pluginName = "vault"
+	// vault check frequency is set by default to 10 hours, if not overridden with Configuration
+	VaultCheckFrequency = 10 * time.Hour
 )
 
 // BuiltIn constructs a catalog.BuiltIn using a new instance of this plugin.
@@ -56,6 +60,12 @@ type Configuration struct {
 	InsecureSkipVerify bool `hcl:"insecure_skip_verify" json:"insecure_skip_verify"`
 	// Name of the Vault namespace
 	Namespace string `hcl:"namespace" json:"namespace"`
+
+	// Enable watcher for renewal
+	EnableWatcher bool `hcl:"enable_watcher" json:"enable_watcher"`
+
+	// How frequently to poll vault for updates to the CA
+	VaultPollFrequency string `hcl:"vault_poll_frequency" json:"vault_poll_frequency"`
 }
 
 // TokenAuthConfig represents parameters for token auth method
@@ -117,6 +127,10 @@ type Plugin struct {
 	hooks struct {
 		lookupEnv func(string) (string, bool)
 	}
+	subscription       chan struct{}
+	upstreamRoot       *x509.Certificate
+	watcherEnabled     bool
+	vaultPollFrequency time.Duration
 }
 
 func New() *Plugin {
@@ -153,20 +167,31 @@ func (p *Plugin) Configure(_ context.Context, req *configv1.ConfigureRequest) (*
 	}
 	vcConfig, err := NewClientConfig(cp, p.logger)
 	if err != nil {
+		err = status.Errorf(codes.InvalidArgument, "error parsing vault poll frequency confiugred - [%s] error: %v", config.VaultPollFrequency, err)
 		return nil, err
 	}
 
 	p.authMethod = am
 	p.cc = vcConfig
 
+	if config.VaultPollFrequency != "" {
+		p.vaultPollFrequency, err = time.ParseDuration(config.VaultPollFrequency)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	p.watcherEnabled = config.EnableWatcher
+
 	return &configv1.ConfigureResponse{}, nil
 }
 
-func (p *Plugin) renewVaultClientAuthIfRequired() (err error) {
+func (p *Plugin) syncVaultClient() (err error) {
+	p.logger.Debug("synching vault client ...")
 	p.mtx.Lock()
 	defer p.mtx.Unlock()
-	renewCh := make(chan struct{})
 	if p.vc == nil {
+		renewCh := make(chan struct{})
 		vc, err := p.cc.NewAuthenticatedClient(p.authMethod, renewCh)
 		if err != nil {
 			return status.Errorf(codes.Internal, "failed to prepare authenticated client: %v", err)
@@ -186,14 +211,43 @@ func (p *Plugin) renewVaultClientAuthIfRequired() (err error) {
 	return
 }
 
-func (p *Plugin) fetchSignedCAChainWithRoots(ttl string, csr *x509.CertificateRequest) (caChain []*types.X509Certificate, upstreamRoots []*types.X509Certificate, err error) {
-	signResp, err := p.vc.SignIntermediate(ttl, csr)
+func (p *Plugin) syncUpstreamRoot(upstreamRoots []*types.X509Certificate) (err error) {
+	p.logger.Debug("synching upstream root...")
+	p.mtx.Lock()
+	defer p.mtx.Unlock()
+	if len(upstreamRoots) < 1 {
+		return status.Error(codes.FailedPrecondition, "empty upstream roots")
+	}
+	certs, err := x509certificate.FromPluginProtos(upstreamRoots)
+	if err != nil {
+		return
+	}
+	p.upstreamRoot = certs[0]
+	return
+}
+
+func (p *Plugin) signIntermediate(ttl string, csr *x509.CertificateRequest) (signResp *SignCSRResponse, err error) {
+	if p.vc == nil {
+		err = p.syncVaultClient()
+		if err != nil {
+			return
+		}
+	}
+	signResp, err = p.vc.SignIntermediate(ttl, csr)
 	if err != nil {
 		return
 	}
 	if signResp == nil {
-		err = status.Error(codes.Internal, "unexpected empty response from UpstreamAuthority") 
-		return 
+		err = status.Error(codes.Internal, "unexpected empty response from UpstreamAuthority")
+		return
+	}
+	return
+}
+
+func (p *Plugin) fetchSignedCAChainWithRoots(ttl string, csr *x509.CertificateRequest) (caChain []*types.X509Certificate, upstreamRoots []*types.X509Certificate, err error) {
+	signResp, err := p.signIntermediate(ttl, csr)
+	if err != nil {
+		return nil, nil, err
 	}
 
 	// Parse CACert in PEM format
@@ -206,20 +260,20 @@ func (p *Plugin) fetchSignedCAChainWithRoots(ttl string, csr *x509.CertificateRe
 	upstreamRoot, err := pemutil.ParseCertificate([]byte(upstreamRootPEM))
 	if err != nil {
 		err = status.Errorf(codes.Internal, "failed to parse Root CA certificate: %v", err)
-		return 
+		return nil, nil, err
 	}
 
 	upstreamRoots, err = x509certificate.ToPluginProtos([]*x509.Certificate{upstreamRoot})
 	if err != nil {
 		err = status.Errorf(codes.Internal, "unable to form response upstream X.509 roots: %v", err)
-		return 
+		return nil, nil, err
 	}
 
 	// Parse PEM format data to get DER format data
 	certificate, err := pemutil.ParseCertificate([]byte(signResp.CACertPEM))
 	if err != nil {
 		err = status.Errorf(codes.Internal, "failed to parse certificate: %v", err)
-		return 
+		return nil, nil, err
 	}
 	certChain := []*x509.Certificate{certificate}
 	for _, c := range signResp.UpstreamCACertChainPEM {
@@ -235,7 +289,7 @@ func (p *Plugin) fetchSignedCAChainWithRoots(ttl string, csr *x509.CertificateRe
 		b, err = pemutil.ParseCertificate([]byte(c))
 		if err != nil {
 			err = status.Errorf(codes.Internal, "failed to parse upstream bundle certificates: %v", err)
-			return 
+			return nil, nil, err
 		}
 		certChain = append(certChain, b)
 	}
@@ -243,12 +297,11 @@ func (p *Plugin) fetchSignedCAChainWithRoots(ttl string, csr *x509.CertificateRe
 	caChain, err = x509certificate.ToPluginProtos(certChain)
 	if err != nil {
 		err = status.Errorf(codes.Internal, "unable to form response X.509 CA chain: %v", err)
-		return 
+		return nil, nil, err
 	}
 
-	return
+	return caChain, upstreamRoots, err
 }
-
 
 func (p *Plugin) MintX509CAAndSubscribe(req *upstreamauthorityv1.MintX509CARequest, stream upstreamauthorityv1.UpstreamAuthority_MintX509CAAndSubscribeServer) error {
 	if p.cc == nil {
@@ -267,13 +320,22 @@ func (p *Plugin) MintX509CAAndSubscribe(req *upstreamauthorityv1.MintX509CAReque
 		return status.Errorf(codes.InvalidArgument, "failed to parse CSR data: %v", err)
 	}
 
+	if p.watcherEnabled {
+		p.logger.Debug("watcher enabled, starting mint with watcher enabled")
+		return p.mintX509CAAndSubscribe(ttl, csr, stream)
+	}
+
+	fmt.Println("watcher is not enabled returning after send...")
+
 	// Lock is not required since the client is not getting initialized here, moved lock to renew method.
 	// p.mtx.Lock()
 	// defer p.mtx.Unlock()
 
 	// ensure vault client is authenticated and exists
-	err = p.renewVaultClientAuthIfRequired()
-	if err != nil { return err }
+	err = p.syncVaultClient()
+	if err != nil {
+		return err
+	}
 
 	x509CAChain, upstreamX509Roots, err := p.fetchSignedCAChainWithRoots(ttl, csr)
 	if err != nil {
@@ -284,6 +346,45 @@ func (p *Plugin) MintX509CAAndSubscribe(req *upstreamauthorityv1.MintX509CAReque
 		X509CaChain:       x509CAChain,
 		UpstreamX509Roots: upstreamX509Roots,
 	})
+}
+
+func (p *Plugin) mintX509CAAndSubscribe(ttl string, csr *x509.CertificateRequest, stream upstreamauthorityv1.UpstreamAuthority_MintX509CAAndSubscribeServer) (err error) {
+	err = p.syncVaultClient()
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithCancel(stream.Context())
+	defer cancel()
+	renewed := p.subscribe(ctx)
+	for {
+		x509CAChain, upstreamX509Roots, err := p.fetchSignedCAChainWithRoots(ttl, csr)
+		if err != nil {
+			return status.Errorf(codes.Internal, "error fetching signed intermediary and ca chain: %v", err)
+		}
+		if len(upstreamX509Roots) < 1 {
+			return status.Error(codes.Internal, "no upstream roots fetched")
+		}
+		err = p.syncUpstreamRoot(upstreamX509Roots)
+		if err != nil {
+			return status.Errorf(codes.Internal, "error synching upstream root on plugin: %v", err)
+		}
+		fmt.Println("serial before send: ", p.upstreamRoot.SerialNumber)
+		err = stream.Send(&upstreamauthorityv1.MintX509CAResponse{
+			X509CaChain:       x509CAChain,
+			UpstreamX509Roots: upstreamX509Roots,
+		})
+		if err != nil {
+			return status.Errorf(codes.Internal, "error sending x509 certificate chain and roots: %v", err)
+		}
+
+		select {
+		case <-stream.Context().Done():
+			p.logger.Warn(stream.Context().Err().Error())
+			return nil
+		case <-renewed:
+			p.logger.Info("Notified for root CA update...")
+		}
+	}
 }
 
 // PublishJWTKeyAndSubscribe is not implemented by the wrapper and returns a codes.Unimplemented status

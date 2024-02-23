@@ -9,6 +9,7 @@ import (
 	"text/template"
 	"time"
 
+	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/vault/sdk/helper/consts"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -219,6 +220,146 @@ func TestConfigure(t *testing.T) {
 
 			if tt.wantNamespaceIsNotNil {
 				require.NotNil(t, p.cc.clientParams.Namespace)
+			}
+		})
+	}
+}
+
+func TestMintX509CA_Subscribe(t *testing.T) {
+	csr, err := pemutil.LoadCertificateRequest(testReqCSR)
+	require.NoError(t, err)
+	// successfulConfig := &Configuration{
+	// 	PKIMountPoint: "test-pki",
+	// 	CACertPath:    "testdata/root-cert.pem",
+	// 	TokenAuth: &TokenAuthConfig{
+	// 		Token: "test-token",
+	// 	},
+	// 	EnableWatcher: true,
+	// }
+
+	for _, tt := range []struct {
+		name                    string
+		csr                     []byte
+		config                  *Configuration
+		ttl                     time.Duration
+		authMethod              AuthMethod
+		expectCode              codes.Code
+		expectMsgPrefix         string
+		expectX509CA            []string
+		expectedX509Authorities []string
+
+		fakeServer func() *FakeVaultServerConfig
+	}{
+		{
+			name: "Mint X509CA SVID with Token authentication",
+			csr:  csr.Raw,
+			config: &Configuration{
+				PKIMountPoint: "test-pki",
+				CACertPath:    "testdata/root-cert.pem",
+				TokenAuth: &TokenAuthConfig{
+					Token: "test-token",
+				},
+				EnableWatcher:      true,
+				VaultPollFrequency: "4s",
+			},
+			authMethod:              TOKEN,
+			expectX509CA:            []string{"spiffe://intermediate-spire", "spiffe://intermediate-vault"},
+			expectedX509Authorities: []string{"spiffe://root"},
+			fakeServer: func() *FakeVaultServerConfig {
+				fakeServer := setupSuccessFakeVaultServer()
+				fakeServer.CAFetchResponse = []byte(testCAFetchResponse)
+				fakeServer.CAFetchResponseCode = 200
+				fakeServer.LookupSelfResponse = []byte(testLookupSelfResponse)
+				fakeServer.CertAuthResponse = []byte{}
+				fakeServer.AppRoleAuthResponse = []byte{}
+				fakeServer.SignIntermediateResponse = []byte(testSignIntermediateResponse)
+
+				return fakeServer
+			},
+		},
+	} {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			fakeVaultServer := tt.fakeServer()
+
+			s, addr, err := fakeVaultServer.NewTLSServer()
+			require.NoError(t, err)
+
+			s.Start()
+			defer s.Close()
+
+			p := New()
+			options := []plugintest.Option{
+				plugintest.CaptureConfigureError(&err),
+				plugintest.CoreConfig(catalog.CoreConfig{TrustDomain: spiffeid.RequireTrustDomainFromString("example.org")}),
+			}
+			if tt.config != nil {
+				tt.config.VaultAddr = fmt.Sprintf("https://%s", addr)
+				cp, err := p.genClientParams(tt.authMethod, tt.config)
+				require.NoError(t, err)
+				p.logger = hclog.Default()
+				p.logger.SetLevel(hclog.Trace)
+				cc, err := NewClientConfig(cp, p.logger)
+				require.NoError(t, err)
+				p.cc = cc
+				options = append(options, plugintest.ConfigureJSON(tt.config))
+			}
+			p.authMethod = tt.authMethod
+
+			v1 := new(upstreamauthority.V1)
+			plugintest.Load(t, builtin(p), v1,
+				options...,
+			)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			x509CA, x509Authorities, stream, err := v1.MintX509CA(ctx, tt.csr, tt.ttl)
+
+			spiretest.RequireGRPCStatusHasPrefix(t, err, tt.expectCode, tt.expectMsgPrefix)
+			if tt.expectCode != codes.OK {
+				require.Nil(t, x509CA)
+				require.Nil(t, x509Authorities)
+				require.Nil(t, stream)
+				return
+			}
+			require.NotNil(t, x509CA)
+			require.NotNil(t, x509Authorities)
+			require.NotNil(t, stream)
+
+			x509CAIDs := certChainURIs(x509CA)
+			require.Equal(t, tt.expectX509CA, x509CAIDs)
+
+			x509AuthoritiesIDs := certChainURIs(x509Authorities)
+			require.Equal(t, tt.expectedX509Authorities, x509AuthoritiesIDs)
+
+			if p.cc.clientParams.Namespace != "" {
+				headers := p.vc.vaultClient.Headers()
+				require.Equal(t, p.cc.clientParams.Namespace, headers.Get(consts.NamespaceHeaderName))
+			}
+
+			streamChan := make(chan []*x509.Certificate)
+			streamer := func() {
+				t.Log("waiting to recv from stream..")
+				certs, _ := stream.RecvUpstreamX509Authorities()
+				streamChan <- certs
+			}
+			time.AfterFunc(20*time.Second, func() {
+				t.Log("calling cancel...")
+				defer func() {
+					close(streamChan)
+					streamChan = nil
+				}()
+				cancel()
+			})
+			for streamChan != nil {
+				go streamer()
+				select {
+				case certs := <-streamChan:
+					t.Log("receveid from stream...")
+					require.NotNil(t, certs)
+					t.Log(certs)
+				case <-ctx.Done():
+					t.Log(ctx.Err().Error())
+				}
 			}
 		})
 	}
@@ -830,6 +971,7 @@ func setupSuccessFakeVaultServer() *FakeVaultServerConfig {
 	fakeVaultServer.SignIntermediateResponseCode = 200
 	fakeVaultServer.SignIntermediateResponse = []byte(testSignIntermediateResponse)
 	fakeVaultServer.SignIntermediateReqEndpoint = "/v1/test-pki/root/sign-intermediate"
+	fakeVaultServer.CAFetchReqEndpoint = "/v1/test-pki/cert/ca"
 
 	return fakeVaultServer
 }

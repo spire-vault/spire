@@ -1,6 +1,7 @@
 package vault
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
@@ -603,6 +604,38 @@ func TestConfigureTLSRequireClientCertAndKey(t *testing.T) {
 	vc := vapi.DefaultConfig()
 	err = cc.configureTLS(vc)
 	spiretest.RequireGRPCStatus(t, err, codes.InvalidArgument, "both client cert and client key are required")
+}
+
+func TestFetchRoot(t *testing.T) {
+	fakeVaultServer := newFakeVaultServer()
+	fakeVaultServer.CAFetchResponseCode = 200
+	fakeVaultServer.CAFetchResponse = []byte(testCAFetchResponse)
+	fakeVaultServer.CertAuthResponseCode = 200
+	fakeVaultServer.CertAuthResponse = []byte(testCertAuthResponse)
+
+	s, addr, err := fakeVaultServer.NewTLSServer()
+	require.NoError(t, err)
+
+	s.Start()
+	defer s.Close()
+
+	cp := &ClientParams{
+		VaultAddr:      fmt.Sprintf("https://%v/", addr),
+		CACertPath:     testRootCert,
+		ClientCertPath: testClientCert,
+		ClientKeyPath:  testClientKey,
+	}
+
+	cc, err := NewClientConfig(cp, hclog.Default())
+	require.NoError(t, err)
+
+	renewCh := make(chan struct{})
+	client, err := cc.NewAuthenticatedClient(CERT, renewCh)
+	require.NoError(t, err)
+	require.NotNil(t, client)
+	resp, err := client.FetchRoot(context.Background())
+	require.NoError(t, err)
+	require.NotEmpty(t, resp.UpstreamCACertPEM)
 }
 
 func TestSignIntermediate(t *testing.T) {

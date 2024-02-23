@@ -1,6 +1,7 @@
 package vault
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
@@ -106,6 +107,10 @@ type SignCSRResponse struct {
 	UpstreamCACertPEM string
 	// Set of Upstream CA certificates
 	UpstreamCACertChainPEM []string
+}
+
+type FetchCAResponse struct {
+	UpstreamCACertPEM string
 }
 
 // NewClientConfig returns a new *ClientConfig with default parameters.
@@ -341,6 +346,28 @@ func (c *Client) LookupSelf(token string) (*vapi.Secret, error) {
 		// don't care any parameters
 	}
 	return secret, nil
+}
+
+// FetchRoot fetches the root CA from pki making a call to the ca pem endpoint
+func (c *Client) FetchRoot(ctx context.Context) (resp *FetchCAResponse, err error) {
+	path := fmt.Sprintf("/%s/cert/ca", c.clientParams.PKIMountPoint)
+	s, err := c.vaultClient.Logical().ReadWithContext(ctx, path)
+	if err != nil {
+		err = status.Errorf(codes.Internal, "error fetching roots from vault: %v", err)
+		fmt.Println("error : ", err)
+		return nil, err
+	}
+	resp = &FetchCAResponse{}
+	certData, ok := s.Data["certificate"]
+	if !ok {
+		return nil, status.Error(codes.Internal, "request is successful, but certificate data is empty")
+	}
+	cert, ok := certData.(string)
+	if !ok {
+		return nil, status.Errorf(codes.Internal, "expected certificate data type %T but got %T", cert, certData)
+	}
+	resp.UpstreamCACertPEM = cert
+	return resp, err
 }
 
 // SignIntermediate requests sign-intermediate endpoint to generate certificate.
