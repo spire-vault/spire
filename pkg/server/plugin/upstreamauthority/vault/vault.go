@@ -3,7 +3,6 @@ package vault
 import (
 	"context"
 	"crypto/x509"
-	"fmt"
 	"os"
 	"strconv"
 	"sync"
@@ -325,7 +324,6 @@ func (p *Plugin) MintX509CAAndSubscribe(req *upstreamauthorityv1.MintX509CAReque
 		return p.mintX509CAAndSubscribe(ttl, csr, stream)
 	}
 
-	fmt.Println("watcher is not enabled returning after send...")
 
 	// Lock is not required since the client is not getting initialized here, moved lock to renew method.
 	// p.mtx.Lock()
@@ -368,7 +366,6 @@ func (p *Plugin) mintX509CAAndSubscribe(ttl string, csr *x509.CertificateRequest
 		if err != nil {
 			return status.Errorf(codes.Internal, "error synching upstream root on plugin: %v", err)
 		}
-		fmt.Println("serial before send: ", p.upstreamRoot.SerialNumber)
 		err = stream.Send(&upstreamauthorityv1.MintX509CAResponse{
 			X509CaChain:       x509CAChain,
 			UpstreamX509Roots: upstreamX509Roots,
