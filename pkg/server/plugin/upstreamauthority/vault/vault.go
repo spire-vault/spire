@@ -324,7 +324,6 @@ func (p *Plugin) MintX509CAAndSubscribe(req *upstreamauthorityv1.MintX509CAReque
 		return p.mintX509CAAndSubscribe(ttl, csr, stream)
 	}
 
-
 	// Lock is not required since the client is not getting initialized here, moved lock to renew method.
 	// p.mtx.Lock()
 	// defer p.mtx.Unlock()
